@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+#
+# tm-guard-snap — Take a Time Machine snapshot before the first Bash
+#                  command of each conversational turn.
+#
+# Called by: PreToolUse hook (matcher: Bash)
+# If the session's sentinel file exists, takes a local TM snapshot,
+# records it in a session-scoped manifest, and clears the sentinel.
+# Subsequent Bash commands in the same turn are unaffected (sentinel
+# already cleared).
+
+set -euo pipefail
+
+readonly STATE_DIR="${TMPDIR:-/tmp}/tm-guard"
+
+session_id="$(jq -r '.session_id // empty')" || exit 0
+[ -n "$session_id" ] || exit 0
+
+readonly SENTINEL="$STATE_DIR/armed-${session_id}"
+
+# Only act on the first Bash command per turn.
+[ -f "$SENTINEL" ] || exit 0
+rm -f "$SENTINEL"
+
+# Take the snapshot. Fail silently: a snapshot failure should never
+# block the user's command.
+tmutil localsnapshot / >/dev/null 2>&1 || true

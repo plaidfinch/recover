@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+#
+# tm-guard-arm — Arm the snapshot trigger for this conversational turn.
+#
+# Called by: UserPromptSubmit hook
+# Reads session_id from hook JSON on stdin, touches a session-scoped
+# sentinel file that tm-guard-snap checks before the first Bash command.
+
+set -euo pipefail
+
+readonly STATE_DIR="${TMPDIR:-/tmp}/tm-guard"
+
+session_id="$(jq -r '.session_id // empty')" || exit 0
+[ -n "$session_id" ] || exit 0
+
+mkdir -p "$STATE_DIR"
+touch "$STATE_DIR/armed-${session_id}"

@@ -1,0 +1,196 @@
+#!/usr/bin/env bash
+#
+# tm-bisect — Binary search Time Machine snapshots for the last one
+#              matching a predicate.
+#
+# Finds the LAST snapshot where <command> exits 0, assuming snapshots
+# transition from matching to not-matching chronologically (e.g., a
+# file existed, then was deleted).
+#
+# The predicate runs with:
+#   - $TM_SNAPSHOT set to the snapshot mount point root
+#   - cwd set to the snapshot equivalent of your current directory
+#     (e.g., if you're in /Users/me/project, cwd becomes
+#     $TM_SNAPSHOT/Users/me/project)
+#
+# On success, prints the still-mounted snapshot path to stdout.
+# The caller is responsible for unmounting: umount "$(tm-bisect ...)"
+#
+# Usage:
+#   tm-bisect <command> [args...]
+#
+# Examples:
+#   # Find last snapshot containing a deleted directory (relative path)
+#   tm-bisect test -d path/to/deleted/dir
+#
+#   # Find last snapshot where a file contained a pattern (absolute path)
+#   tm-bisect sh -c 'grep -q "pattern" "$TM_SNAPSHOT/Users/me/notes.txt"'
+#
+#   # Recover: mount, copy, unmount
+#   snap="$(tm-bisect test -f path/to/lost/file.txt)"
+#   cp "$snap/Users/me/project/path/to/lost/file.txt" ./recovered/
+#   umount "$snap"
+
+set -euo pipefail
+
+readonly PROG="$(basename "$0")"
+readonly MOUNT_DIR="$(mktemp -d "/tmp/tm-bisect.XXXXXX")"
+
+# The caller's working directory, resolved to a physical path so we can
+# map it into the snapshot reliably. On macOS /System/Volumes/Data is the
+# real mount point for user data; strip that prefix if present so we get
+# a canonical path like /Users/me/project.
+resolve_caller_cwd() {
+    local cwd
+    cwd="$(pwd -P)"
+    # /System/Volumes/Data/Users/... -> /Users/...
+    cwd="${cwd#/System/Volumes/Data}"
+    printf '%s' "$cwd"
+}
+
+readonly CALLER_CWD="$(resolve_caller_cwd)"
+
+# --- helpers ---------------------------------------------------------------
+
+die() {
+    printf '%s: error: %s\n' "$PROG" "$*" >&2
+    exit 1
+}
+
+log() {
+    printf '%s: %s\n' "$PROG" "$*" >&2
+}
+
+# Unmount if mounted, ignoring errors.
+unmount_quiet() {
+    # Always attempt umount unconditionally. Checking `mount` output is
+    # unreliable on macOS because /tmp resolves to /private/tmp in mount
+    # output but not necessarily in $MOUNT_DIR. A redundant umount on an
+    # unmounted path is harmless (just returns an error we discard).
+    umount "$1" 2>/dev/null || true
+}
+
+# On exit, clean up the mount point unless we're keeping it for the caller.
+cleanup() {
+    if [ -z "${KEEP_MOUNTED:-}" ]; then
+        unmount_quiet "$MOUNT_DIR"
+        rmdir "$MOUNT_DIR" 2>/dev/null || true
+    fi
+}
+trap cleanup EXIT
+
+# Mount a snapshot at $MOUNT_DIR. Unmounts any previous snapshot first.
+# Returns 0 on success, 1 on failure (e.g., pruned/corrupt snapshot).
+mount_snapshot() {
+    local snap_name="$1"
+    unmount_quiet "$MOUNT_DIR"
+    if ! mount_apfs -s "$snap_name" -o ro /System/Volumes/Data "$MOUNT_DIR" 2>/dev/null; then
+        log "skipping unmountable snapshot: ${snap_name##*.TimeMachine.}"
+        return 1
+    fi
+}
+
+# Mount a snapshot and run the predicate. Returns 0 if the predicate
+# matches, 1 otherwise (including mount failures and missing cwd).
+probe() {
+    local snap_name="$1"
+    shift
+
+    mount_snapshot "$snap_name" || return 1
+
+    local snap_cwd="${MOUNT_DIR}${CALLER_CWD}"
+
+    # If the caller's cwd doesn't exist in this snapshot, the predicate
+    # cannot match (the directory didn't exist at that point in time).
+    if [ ! -d "$snap_cwd" ]; then
+        return 1
+    fi
+
+    ( cd "$snap_cwd" && TM_SNAPSHOT="$MOUNT_DIR" "$@" )
+}
+
+# --- main ------------------------------------------------------------------
+
+if [ $# -eq 0 ]; then
+    cat >&2 <<'USAGE'
+Usage: tm-bisect <command> [args...]
+
+Binary search Time Machine snapshots for the last one where <command>
+exits 0. The predicate runs with cwd set to the snapshot equivalent of
+your current directory, and $TM_SNAPSHOT set to the snapshot root.
+
+On success, prints the still-mounted snapshot path to stdout.
+Unmount when done: umount "$(tm-bisect ...)"
+
+Examples:
+  tm-bisect test -d path/to/deleted/dir
+  tm-bisect sh -c 'grep -q "TODO" "$TM_SNAPSHOT/Users/me/notes.txt"'
+USAGE
+    exit 1
+fi
+
+# Gather snapshots, sorted chronologically (lexical sort works for the
+# com.apple.TimeMachine.YYYY-MM-DD-HHmmss.local format).
+mapfile -t SNAPS < <(
+    tmutil listlocalsnapshots / 2>/dev/null \
+        | grep '^com\.apple\.TimeMachine\.' \
+        | sort
+)
+
+if [ ${#SNAPS[@]} -eq 0 ]; then
+    die "no Time Machine snapshots found"
+fi
+
+log "${#SNAPS[@]} snapshots (${SNAPS[0]##*.TimeMachine.} .. ${SNAPS[-1]##*.TimeMachine.})"
+
+mkdir -p "$MOUNT_DIR"
+
+# --- boundary checks before bisecting -------------------------------------
+
+# If the latest snapshot matches, that's our answer.
+log "probing latest"
+if probe "${SNAPS[-1]}" "$@"; then
+    log "latest snapshot matches: ${SNAPS[-1]##*.TimeMachine.}"
+    KEEP_MOUNTED=1
+    printf '%s\n' "$MOUNT_DIR"
+    exit 0
+fi
+
+# Scan forward from the earliest to find one that mounts and matches.
+# Pruned/corrupt snapshots are skipped.
+lo=-1
+for (( i = 0; i < ${#SNAPS[@]} - 1; i++ )); do
+    log "probing early: ${SNAPS[$i]##*.TimeMachine.}"
+    if probe "${SNAPS[$i]}" "$@"; then
+        lo=$i
+        break
+    fi
+done
+
+if [ $lo -lt 0 ]; then
+    die "predicate does not match any snapshot"
+fi
+
+# --- binary search ---------------------------------------------------------
+# Invariant: SNAPS[lo] matches, SNAPS[hi] does not.
+
+hi=$(( ${#SNAPS[@]} - 1 ))
+
+while (( hi - lo > 1 )); do
+    mid=$(( (lo + hi) / 2 ))
+    log "bisecting [${lo}..${hi}] mid=${mid}: ${SNAPS[$mid]##*.TimeMachine.}"
+
+    if probe "${SNAPS[$mid]}" "$@"; then
+        lo=$mid
+    else
+        hi=$mid
+    fi
+done
+
+log "found: ${SNAPS[$lo]##*.TimeMachine.}"
+
+# Mount the result and leave it for the caller.
+mount_snapshot "${SNAPS[$lo]}" || die "cannot remount result snapshot"
+KEEP_MOUNTED=1
+
+printf '%s\n' "$MOUNT_DIR"
