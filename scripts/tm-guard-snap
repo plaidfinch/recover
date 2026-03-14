@@ -1,27 +1,52 @@
 #!/usr/bin/env bash
 #
-# tm-guard-snap — Take a Time Machine snapshot before the first Bash
-#                  command of each conversational turn.
+# tm-guard-snap — Take Time Machine snapshots to protect Claude Code sessions.
 #
 # Called by: PreToolUse hook (matcher: Bash)
-# If the session's sentinel file exists, takes a local TM snapshot,
-# records it in a session-scoped manifest, and clears the sentinel.
-# Subsequent Bash commands in the same turn are unaffected (sentinel
-# already cleared).
+#
+# Two triggers:
+#   1. Turn start: If the session's sentinel file exists (armed by
+#      tm-guard-arm), takes a snapshot and clears the sentinel.
+#   2. Periodic: If 5+ minutes have elapsed since the last snapshot
+#      for this session, takes another. This catches long-running
+#      non-interactive threads that would otherwise go unprotected.
 
 set -euo pipefail
 
 readonly STATE_DIR="${TMPDIR:-/tmp}/tm-guard"
+readonly INTERVAL=300  # seconds between periodic checkpoints
 
 session_id="$(jq -r '.session_id // empty')" || exit 0
 [ -n "$session_id" ] || exit 0
 
 readonly SENTINEL="$STATE_DIR/armed-${session_id}"
+readonly LAST_SNAP="$STATE_DIR/last-snap-${session_id}"
 
-# Only act on the first Bash command per turn.
-[ -f "$SENTINEL" ] || exit 0
-rm -f "$SENTINEL"
+# Take a snapshot and record the time. Fail silently: a snapshot
+# failure should never block the user's command.
+take_snapshot() {
+    tmutil localsnapshot / >/dev/null 2>&1 || true
+    touch "$LAST_SNAP"
+}
 
-# Take the snapshot. Fail silently: a snapshot failure should never
-# block the user's command.
-tmutil localsnapshot / >/dev/null 2>&1 || true
+# First Bash command of a new turn: always snapshot.
+if [ -f "$SENTINEL" ]; then
+    rm -f "$SENTINEL"
+    take_snapshot
+    exit 0
+fi
+
+# Periodic checkpoint: snapshot if enough time has elapsed.
+if [ ! -f "$LAST_SNAP" ]; then
+    # No record of a prior snapshot this session — take one.
+    take_snapshot
+    exit 0
+fi
+
+now="$(date +%s)"
+last_time="$(stat -f %m "$LAST_SNAP")"
+age=$(( now - last_time ))
+
+if [ "$age" -ge "$INTERVAL" ]; then
+    take_snapshot
+fi
